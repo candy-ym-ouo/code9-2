@@ -1,3 +1,4 @@
+import { localDateKey } from '@flil/shared';
 import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { errors } from '../http/errors.js';
 import type { InspirationRow } from './serialization.js';
@@ -101,6 +102,65 @@ export function createInspiration(params: {
   return id;
 }
 
+/** 归并判定用的标题归一化：忽略大小写与空白差异 */
+export function normalizeTitle(title: string): string {
+  return title.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+export interface InboxDuplicateHit {
+  id: string;
+  title: string;
+  matchedBy: 'fingerprint' | 'title_time';
+}
+
+/**
+ * 收件箱归并判定：同一库内未删除且非终态的卡，满足任一条件即视为同一条灵感——
+ *  1. 图片指纹：已持有任一待导入图片（asset.sha256）；
+ *  2. 标题 + 时间：归一化标题相同，且创建于库时区的同一天。
+ * 指纹优先于标题；多个候选时取最近更新的一张。命中后导入方应并入该卡而不是新建。
+ */
+export function findInboxDuplicate(
+  libraryId: string,
+  params: { title: string; sha256s?: string[]; now?: Date },
+): InboxDuplicateHit | null {
+  const db = getDb();
+  const fingerprints = (params.sha256s ?? []).filter(Boolean);
+  if (fingerprints.length) {
+    const marks = fingerprints.map(() => '?').join(',');
+    const row = db
+      .prepare(
+        `SELECT i.id, i.title FROM asset a
+         JOIN inspiration i ON i.id = a.inspiration_id
+         WHERE a.library_id = ? AND a.sha256 IN (${marks})
+           AND i.deleted_at IS NULL AND i.status NOT IN ('archived','dropped')
+         ORDER BY i.updated_at DESC LIMIT 1`,
+      )
+      .get(libraryId, ...fingerprints) as { id: string; title: string } | undefined;
+    if (row) return { id: row.id, title: row.title, matchedBy: 'fingerprint' };
+  }
+
+  const normalized = normalizeTitle(params.title);
+  if (!normalized) return null;
+  const lib = db.prepare('SELECT tz FROM library WHERE id = ?').get(libraryId) as
+    | { tz: string }
+    | undefined;
+  const tz = lib?.tz ?? 'Asia/Shanghai';
+  const todayKey = localDateKey(params.now ?? new Date(), tz);
+  const candidates = db
+    .prepare(
+      `SELECT id, title, created_at FROM inspiration
+       WHERE library_id = ? AND deleted_at IS NULL AND status NOT IN ('archived','dropped')
+       ORDER BY updated_at DESC`,
+    )
+    .all(libraryId) as { id: string; title: string; created_at: string }[];
+  const hit = candidates.find(
+    (c) =>
+      normalizeTitle(c.title) === normalized &&
+      localDateKey(new Date(c.created_at), tz) === todayKey,
+  );
+  return hit ? { id: hit.id, title: hit.title, matchedBy: 'title_time' } : null;
+}
+
 export function addTags(
   inspirationId: string,
   tagIds: string[],
@@ -173,9 +233,21 @@ export function dropInspiration(id: string, reason: string): void {
     .run('dropped', reason, nowIso(), id);
 }
 
-/** 合并重复卡：标签与图片并入 keep，来源卡进终态 dropped（文档 9.2） */
-export function mergeInspirations(keepId: string, mergeIds: string[], reason = 'merged'): void {
+export interface MergeStats {
+  merged: number;
+  movedTags: number;
+  movedAssets: number;
+  movedWindows: number;
+}
+
+/**
+ * 合并重复卡：标签、素材与窗口历史全部并入 keep，来源卡进终态 dropped（文档 9.2）。
+ * 窗口按 (date, start_at) 去重：keep 已有同时段窗口时，把计划引用改指到 keep 的窗口再删重复行，
+ * 保证合并后窗口历史完整且不产生重复时段。
+ */
+export function mergeInspirations(keepId: string, mergeIds: string[], reason = 'merged'): MergeStats {
   const db = getDb();
+  const stats: MergeStats = { merged: 0, movedTags: 0, movedAssets: 0, movedWindows: 0 };
   const run = db.transaction(() => {
     for (const mergeId of mergeIds) {
       if (mergeId === keepId) continue;
@@ -183,12 +255,37 @@ export function mergeInspirations(keepId: string, mergeIds: string[], reason = '
         .prepare('SELECT tag_id FROM inspiration_tag WHERE inspiration_id = ?')
         .all(mergeId) as { tag_id: string }[];
       for (const t of tags) {
-        db.prepare(
-          `INSERT INTO inspiration_tag (inspiration_id, tag_id, source, created_at) VALUES (?,?, 'bulk', ?)
-           ON CONFLICT (inspiration_id, tag_id) DO NOTHING`,
-        ).run(keepId, t.tag_id, nowIso());
+        const res = db
+          .prepare(
+            `INSERT INTO inspiration_tag (inspiration_id, tag_id, source, created_at) VALUES (?,?, 'bulk', ?)
+             ON CONFLICT (inspiration_id, tag_id) DO NOTHING`,
+          )
+          .run(keepId, t.tag_id, nowIso());
+        if (res.changes > 0) {
+          stats.movedTags += 1;
+          db.prepare('UPDATE tag SET usage_count = usage_count + 1 WHERE id = ?').run(t.tag_id);
+        }
       }
-      db.prepare('UPDATE asset SET inspiration_id = ? WHERE inspiration_id = ?').run(keepId, mergeId);
+      stats.movedAssets += db
+        .prepare('UPDATE asset SET inspiration_id = ? WHERE inspiration_id = ?')
+        .run(keepId, mergeId).changes;
+
+      const windows = db
+        .prepare('SELECT id, date, start_at FROM repro_window WHERE inspiration_id = ?')
+        .all(mergeId) as { id: string; date: string; start_at: string }[];
+      for (const w of windows) {
+        const conflict = db
+          .prepare('SELECT id FROM repro_window WHERE inspiration_id = ? AND date = ? AND start_at = ?')
+          .get(keepId, w.date, w.start_at) as { id: string } | undefined;
+        if (conflict) {
+          db.prepare('UPDATE shoot_plan SET window_id = ? WHERE window_id = ?').run(conflict.id, w.id);
+          db.prepare('DELETE FROM repro_window WHERE id = ?').run(w.id);
+        } else {
+          db.prepare('UPDATE repro_window SET inspiration_id = ? WHERE id = ?').run(keepId, w.id);
+          stats.movedWindows += 1;
+        }
+      }
+
       db.prepare('UPDATE inspiration SET status = ?, archived_reason = ?, updated_at = ? WHERE id = ?').run(
         'dropped',
         reason,
@@ -196,11 +293,13 @@ export function mergeInspirations(keepId: string, mergeIds: string[], reason = '
         mergeId,
       );
       reindexFts(mergeId);
+      stats.merged += 1;
     }
     reindexFts(keepId);
   });
   run();
   syncStatus(keepId);
+  return stats;
 }
 
 /** 维护 FTS 索引（检索用，文档 15.1） */

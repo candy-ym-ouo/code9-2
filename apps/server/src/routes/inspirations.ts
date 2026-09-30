@@ -24,6 +24,7 @@ import {
   archiveInspiration,
   createInspiration,
   dropInspiration,
+  findInboxDuplicate,
   mergeInspirations,
   removeTags,
   requireInspiration,
@@ -34,7 +35,7 @@ import {
 } from '../services/inspirations.js';
 import { toAssetDto, toAnnotationDto, toInspirationDto, toSpotDto } from '../services/serialization.js';
 import type { SerializeContext } from '../services/serialization.js';
-import { ingestAsset, type AssetRow } from '../services/assets.js';
+import { assetSha256, ingestAsset, type AssetRow } from '../services/assets.js';
 import { clearFuzzCache, loadSpotRow } from '../services/fuzzing.js';
 import { loadSpotGeom } from '../services/windowEngine.js';
 import { azimuthAt, elevationAt, utcToZonedParts, zonedTimeToUtc } from '@flil/shared';
@@ -113,13 +114,93 @@ inspirationRouter.post(
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     const input = createInspirationSchema.parse(req.body);
+    // 收件箱归并：同标题且当天已有活跃卡 → 返回既有卡，不新增记录
+    const dup = findInboxDuplicate(ctx.libraryId, { title: input.title });
+    if (dup) {
+      ok(res, { id: dup.id, deduplicated: true, matchedBy: dup.matchedBy });
+      return;
+    }
     const id = createInspiration({
       libraryId: ctx.libraryId,
       title: input.title,
       note: input.note ?? null,
       seasonTags: input.seasonTags,
     });
-    ok(res, { id }, 201);
+    ok(res, { id, deduplicated: false }, 201);
+  }),
+);
+
+/**
+ * 收件箱一键导入：标题 + 可选图片，一次完成建卡与上传。
+ * 归并规则：图片指纹 > 标题+当天。命中既有卡时只补入新图（重复图片按指纹跳过），
+ * 整批重复导入返回 200 且不新增任何记录。
+ */
+inspirationRouter.post(
+  '/inspirations/import',
+  upload.array('files', 20),
+  ah(async (req, res) => {
+    const ctx = ctxOf(req);
+    const input = z
+      .object({
+        title: z.string().min(1).max(200),
+        note: z.string().max(5000).nullable().optional(),
+        role: z.enum(['reference', 'detail', 'panorama', 'result']).default('reference'),
+      })
+      .parse(req.body ?? {});
+    const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+    for (const file of files) {
+      const mime = file.mimetype ?? '';
+      if (!mime.startsWith('image/')) throw errors.badRequest(`只接受图片文件：${file.originalname}`);
+    }
+
+    const dup = findInboxDuplicate(ctx.libraryId, {
+      title: input.title,
+      sha256s: files.map((f) => assetSha256(f.buffer)),
+    });
+
+    let id: string;
+    let created = false;
+    if (dup) {
+      id = dup.id;
+    } else {
+      id = createInspiration({
+        libraryId: ctx.libraryId,
+        title: input.title,
+        note: input.note ?? null,
+      });
+      created = true;
+    }
+
+    const row = requireInspiration(id, ctx.libraryId);
+    const spot = row.spot_id ? loadSpotGeom(row.spot_id) : null;
+    const items = [];
+    for (const file of files) {
+      items.push(
+        await ingestAsset({
+          libraryId: ctx.libraryId,
+          inspirationId: id,
+          role: input.role,
+          filename: file.originalname,
+          buffer: file.buffer,
+          spot: spot ? { lat: spot.lat, lng: spot.lng, tz: spot.tz } : null,
+        }),
+      );
+    }
+    if (files.length) touch(id);
+    // ingestAsset 对同卡同指纹返回 duplicateOf === assetId（未新增记录）
+    const skipped = items.filter((i) => i.duplicateOf === i.assetId).length;
+    ok(
+      res,
+      {
+        id,
+        created,
+        matchedBy: dup?.matchedBy ?? null,
+        addedAssets: items.length - skipped,
+        skippedDuplicates: skipped,
+        items,
+      },
+      created ? 201 : 200,
+    );
   }),
 );
 
@@ -236,8 +317,8 @@ inspirationRouter.post(
       .parse(req.body);
     requireInspiration(input.keepId, ctx.libraryId);
     for (const id of input.mergeIds) requireInspiration(id, ctx.libraryId);
-    mergeInspirations(input.keepId, input.mergeIds, input.reason ?? 'merged');
-    ok(res, { merged: input.mergeIds.length });
+    const stats = mergeInspirations(input.keepId, input.mergeIds, input.reason ?? 'merged');
+    ok(res, stats);
   }),
 );
 

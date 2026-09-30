@@ -57,9 +57,16 @@ export interface IngestResult {
   height: number;
 }
 
+export function assetSha256(buffer: Buffer): string {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
 /**
  * 单张图片入库管线（文档 11.3）：
  * 落盘 → 元数据 → 缩略图 → 主色 → 拍摄时刻太阳位置 → 判重。
+ * 判重（图片指纹 = 内容 sha256）：
+ *  - 同一张卡已有同指纹图片 → 直接返回既有记录，不落盘、不插行（重复导入不新增记录）；
+ *  - 同库其他卡持有同指纹 → 仍入库，但通过 duplicateOf 告知调用方（收件箱据此归并）。
  * 注意：EXIF 中的 GPS **默认不落库**，只记录布尔位并提示用户。
  */
 export async function ingestAsset(params: {
@@ -74,7 +81,24 @@ export async function ingestAsset(params: {
   const db = getDb();
   const { libraryId, inspirationId, role, buffer, spot } = params;
 
-  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+  const sha256 = assetSha256(buffer);
+  const sameCard = db
+    .prepare(
+      'SELECT id, shot_at, width, height, has_gps_exif FROM asset WHERE inspiration_id = ? AND sha256 = ? LIMIT 1',
+    )
+    .get(inspirationId, sha256) as
+    | { id: string; shot_at: string | null; width: number; height: number; has_gps_exif: number }
+    | undefined;
+  if (sameCard) {
+    return {
+      assetId: sameCard.id,
+      duplicateOf: sameCard.id,
+      hasGpsExif: sameCard.has_gps_exif === 1,
+      shotAt: sameCard.shot_at,
+      width: sameCard.width,
+      height: sameCard.height,
+    };
+  }
   const existing = db
     .prepare('SELECT id FROM asset WHERE library_id = ? AND sha256 = ? LIMIT 1')
     .get(libraryId, sha256) as { id: string } | undefined;

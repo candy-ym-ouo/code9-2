@@ -121,7 +121,30 @@ function useInvalidate(keys: string[]) {
 export function useCreateInspiration() {
   const invalidate = useInvalidate(['inspirations']);
   return useMutation({
-    mutationFn: (body: { title: string; note?: string | null }) => post<{ id: string }>('/inspirations', body),
+    mutationFn: (body: { title: string; note?: string | null }) =>
+      post<{ id: string; deduplicated: boolean }>('/inspirations', body),
+    onSuccess: invalidate,
+  });
+}
+
+export interface ImportInspirationResult {
+  id: string;
+  created: boolean;
+  matchedBy: 'fingerprint' | 'title_time' | null;
+  addedAssets: number;
+  skippedDuplicates: number;
+  items: { assetId: string; duplicateOf: string | null; hasGpsExif: boolean }[];
+}
+
+export function useImportInspiration() {
+  const invalidate = useInvalidate(['inspirations']);
+  return useMutation({
+    mutationFn: ({ title, files, note }: { title: string; files?: File[]; note?: string | null }) =>
+      upload<ImportInspirationResult>(
+        '/inspirations/import',
+        files ?? [],
+        note ? { title, note } : { title },
+      ),
     onSuccess: invalidate,
   });
 }
