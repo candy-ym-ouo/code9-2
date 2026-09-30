@@ -55,12 +55,17 @@ export interface IngestResult {
   shotAt: string | null;
   width: number;
   height: number;
+  /** true = 同指纹素材在本库已存在，本次没有重复落盘/落库 */
+  deduped: boolean;
 }
 
 /**
  * 单张图片入库管线（文档 11.3）：
  * 落盘 → 元数据 → 缩略图 → 主色 → 拍摄时刻太阳位置 → 判重。
  * 注意：EXIF 中的 GPS **默认不落库**，只记录布尔位并提示用户。
+ *
+ * 收件箱归并：同 sha256 的素材在本库已存在时直接复用（deduped=true），
+ * 不重复落盘、不重复落库——"重复导入不新增记录"在素材层同样成立。
  */
 export async function ingestAsset(params: {
   libraryId: string;
@@ -70,14 +75,27 @@ export async function ingestAsset(params: {
   buffer: Buffer;
   /** 若已知机位坐标，则用拍摄时刻计算当时太阳位置 */
   spot?: { lat: number; lng: number; tz: string } | null;
+  /** 调用方（收件箱导入）已算好的指纹；不传则在此计算 */
+  sha256?: string;
 }): Promise<IngestResult> {
   const db = getDb();
   const { libraryId, inspirationId, role, buffer, spot } = params;
 
-  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+  const sha256 = params.sha256 ?? crypto.createHash('sha256').update(buffer).digest('hex');
   const existing = db
     .prepare('SELECT id FROM asset WHERE library_id = ? AND sha256 = ? LIMIT 1')
     .get(libraryId, sha256) as { id: string } | undefined;
+  if (existing) {
+    return {
+      assetId: existing.id,
+      duplicateOf: existing.id,
+      hasGpsExif: false,
+      shotAt: null,
+      width: 0,
+      height: 0,
+      deduped: true,
+    };
+  }
 
   const image = sharp(buffer, { failOn: 'none' });
   const metadata = await image.metadata();
@@ -170,6 +188,7 @@ export async function ingestAsset(params: {
     shotAt: exif.shotAt ? exif.shotAt.toISOString() : null,
     width: metadata.width ?? 0,
     height: metadata.height ?? 0,
+    deduped: false,
   };
 }
 

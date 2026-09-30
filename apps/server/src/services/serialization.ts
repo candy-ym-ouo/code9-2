@@ -138,6 +138,9 @@ export interface InspirationRow {
   miss_count: number;
   hit_rate: number;
   archived_reason: string | null;
+  title_key: string | null;
+  occurred_at: string | null;
+  deleted_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -182,6 +185,7 @@ export function toInspirationDto(
     note: row.note,
     status: row.status,
     seasonTags: parseJson<number[]>(row.season_tags, []),
+    occurredAt: row.occurred_at ?? null,
     hitCount: row.hit_count,
     partialCount: row.partial_count,
     missCount: row.miss_count,

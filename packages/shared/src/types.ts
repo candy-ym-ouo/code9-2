@@ -138,6 +138,8 @@ export interface InspirationDto {
   note: string | null;
   status: InspirationStatus;
   seasonTags: number[];
+  /** 发生时间（通常取图片 EXIF 拍摄时刻）；收件箱按标题+时间归并 */
+  occurredAt: string | null;
   hitCount: number;
   partialCount: number;
   missCount: number;

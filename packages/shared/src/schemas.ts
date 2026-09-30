@@ -54,6 +54,7 @@ export const updateInspirationSchema = z.object({
   title: z.string().min(1).max(200).optional(),
   note: z.string().max(5000).nullable().optional(),
   seasonTags: z.array(z.number().int().min(1).max(12)).optional(),
+  occurredAt: z.string().datetime().nullable().optional(),
   status: zEnum(InspirationStatus).optional(),
   spotId: z.string().min(1).nullable().optional(),
 });

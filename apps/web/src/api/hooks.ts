@@ -277,6 +277,55 @@ export function useUploadAssets() {
   });
 }
 
+export interface InboxImportResult {
+  inspirationId: string;
+  duplicated: boolean;
+  matchKey: 'image_fingerprint' | 'title_time' | null;
+  assetSkipped: boolean;
+  importedAssetIds: string[];
+  skippedAssetCount: number;
+  tagsAdded: number;
+  message: string;
+}
+
+/** 收件箱导入（按图片指纹 / 标题+时间归并，重复导入不新增记录） */
+export function useInboxImport() {
+  const invalidate = useInvalidate(['inspirations', 'inspiration', 'search']);
+  return useMutation({
+    mutationFn: ({
+      files,
+      title,
+      note,
+      occurredAt,
+      tagIds,
+    }: {
+      files: File[];
+      title?: string;
+      note?: string;
+      occurredAt?: string;
+      tagIds?: string[];
+    }) =>
+      upload<InboxImportResult>('/inbox/import', files, {
+        ...(title ? { title } : {}),
+        ...(note ? { note } : {}),
+        ...(occurredAt ? { occurredAt } : {}),
+        ...(tagIds?.length ? { tagIds: tagIds.join(',') } : {}),
+      }),
+    onSuccess: invalidate,
+  });
+}
+
+/** 导入前探测：不写数据，只看会不会命中重复 */
+export function useInboxProbe() {
+  return useMutation({
+    mutationFn: (body: { title: string; occurredAt?: string | null; sha256?: string | null }) =>
+      post<{ duplicated: boolean; assetExists: boolean; match: { inspirationId: string; matchKey: string } | null }>(
+        '/inbox/probe',
+        body,
+      ),
+  });
+}
+
 export function useSaveAnnotations() {
   const invalidate = useInvalidate(['inspiration']);
   return useMutation({

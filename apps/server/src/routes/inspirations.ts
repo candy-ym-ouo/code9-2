@@ -28,10 +28,12 @@ import {
   removeTags,
   requireInspiration,
   reindexFts,
+  setMergeKeys,
   setSpot,
   syncStatus,
   touch,
 } from '../services/inspirations.js';
+import { importToInbox, probeInboxDuplicate, sha256OfBuffer } from '../services/inbox.js';
 import { toAssetDto, toAnnotationDto, toInspirationDto, toSpotDto } from '../services/serialization.js';
 import type { SerializeContext } from '../services/serialization.js';
 import { ingestAsset, type AssetRow } from '../services/assets.js';
@@ -123,6 +125,112 @@ inspirationRouter.post(
   }),
 );
 
+// ------------------------------------------------------------- 收件箱导入
+
+/**
+ * 导入前探测（不写任何东西）：给标题/拍摄时间/图片指纹，返回是否会命中已有卡。
+ * 前端在上传前用它提示"这是重复项，将并入已有卡片"。
+ */
+inspirationRouter.post(
+  '/inbox/probe',
+  ah(async (req, res) => {
+    const ctx = ctxOf(req);
+    const input = z
+      .object({
+        title: z.string().min(1).max(200),
+        occurredAt: z.string().datetime().nullable().optional(),
+        sha256: z.string().regex(/^[0-9a-f]{64}$/).nullable().optional(),
+      })
+      .parse(req.body);
+    const probe = probeInboxDuplicate(ctx.libraryId, {
+      title: input.title,
+      occurredAt: input.occurredAt ?? null,
+      sha256: input.sha256 ?? null,
+    });
+    ok(res, { duplicated: probe.match !== null, assetExists: probe.assetExists, match: probe.match });
+  }),
+);
+
+/**
+ * 收件箱导入（幂等）：multipart 表单。
+ *   title（可选，默认取第一张图的文件名）/ note / occurredAt（拍摄时间）/ tagIds（逗号分隔）
+ *   files：1–20 张图片
+ * 归并键优先级：图片指纹（sha256）→ 归一化标题 + 时间（±90 分钟）。
+ * 命中重复时不新增卡片，走全量保留归并；同指纹素材不重复落盘。
+ */
+inspirationRouter.post(
+  '/inbox/import',
+  upload.array('files', 20),
+  ah(async (req, res) => {
+    const ctx = ctxOf(req);
+    const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+    if (!files.length) throw errors.badRequest('没有收到文件');
+
+    const bodyTitle = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    const title =
+      bodyTitle || files[0].originalname.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ').trim() || '未命名灵感';
+    const note = typeof req.body?.note === 'string' && req.body.note ? req.body.note : null;
+
+    let occurredAt: string | null = null;
+    if (typeof req.body?.occurredAt === 'string' && req.body.occurredAt) {
+      const parsed = z.string().datetime().safeParse(req.body.occurredAt);
+      if (!parsed.success) throw errors.badRequest('occurredAt 必须是 ISO 时间');
+      occurredAt = req.body.occurredAt;
+    }
+
+    const tagIds = String(req.body?.tagIds ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const tagId of tagIds) {
+      const t = getDb().prepare('SELECT id FROM tag WHERE id = ? AND library_id = ?').get(tagId, ctx.libraryId);
+      if (!t) throw errors.badRequest(`标签不存在：${tagId}`);
+    }
+
+    for (const file of files) {
+      if (!(file.mimetype ?? '').startsWith('image/')) {
+        throw errors.badRequest(`只接受图片文件：${file.originalname}`);
+      }
+    }
+
+    const result = await importToInbox(
+      ctx.libraryId,
+      {
+        title,
+        note,
+        occurredAt,
+        tagIds: tagIds.length ? tagIds : undefined,
+        files: files.map((f) => ({ filename: f.originalname, buffer: f.buffer, sha256: sha256OfBuffer(f.buffer) })),
+      },
+      async ({ libraryId, inspirationId, filename, buffer, sha256 }) => {
+        const ingested = await ingestAsset({
+          libraryId,
+          inspirationId,
+          role: 'reference',
+          filename,
+          buffer,
+          sha256,
+        });
+        return { assetId: ingested.assetId };
+      },
+    );
+
+    const statusCode = result.duplicated ? 200 : 201;
+    ok(
+      res,
+      {
+        ...result,
+        message: result.duplicated
+          ? result.matchKey === 'image_fingerprint'
+            ? '图片指纹命中：已并入已有卡片，未新增记录'
+            : '标题与时间命中：已归并进已有卡片，标签与素材完整保留'
+          : '已加入收件箱',
+      },
+      statusCode,
+    );
+  }),
+);
+
 inspirationRouter.get(
   '/inspirations/:id',
   ah(async (req, res) => {
@@ -155,6 +263,10 @@ inspirationRouter.patch(
       sets.push('season_tags = ?');
       args.push(toJson(input.seasonTags));
     }
+    if (input.occurredAt !== undefined) {
+      sets.push('occurred_at = ?');
+      args.push(input.occurredAt);
+    }
     if (input.spotId !== undefined) {
       if (input.spotId !== null) {
         const spot = db.prepare('SELECT id FROM spot WHERE id = ? AND library_id = ?').get(input.spotId, ctx.libraryId);
@@ -169,6 +281,7 @@ inspirationRouter.patch(
         nowIso(),
         row.id,
       );
+      setMergeKeys(row.id, { title: input.title, occurredAt: input.occurredAt });
       reindexFts(row.id);
     }
     if (input.status && input.status !== row.status) {
@@ -597,6 +710,33 @@ inspirationRouter.get(
       precise: { lat: found.spot.lat, lng: found.spot.lng },
       fuzz: preview.fuzz,
       distanceKmHint: level === 'exact' ? 0 : null,
+    });
+  }),
+);
+
+inspirationRouter.get(
+  '/inspirations/:id/merge-history',
+  ah(async (req, res) => {
+    const ctx = ctxOf(req);
+    requireInspiration(req.params.id, ctx.libraryId);
+    // 这张卡并入过谁（keep 视角）+ 它是否曾被并入别人（merged 视角，正常为空因为被并卡已终态）
+    const rows = getDb()
+      .prepare(
+        `SELECT m.*, i.title AS merged_title
+         FROM inspiration_merge_log m JOIN inspiration i ON i.id = m.merged_id
+         WHERE m.library_id = ? AND m.keep_id = ?
+         ORDER BY m.created_at DESC LIMIT 200`,
+      )
+      .all(ctx.libraryId, req.params.id) as Record<string, unknown>[];
+    ok(res, {
+      items: rows.map((r) => ({
+        id: r.id,
+        mergedId: r.merged_id,
+        mergedTitle: r.merged_title,
+        matchKey: r.match_key,
+        matchedSha256: r.matched_sha256,
+        createdAt: r.created_at,
+      })),
     });
   }),
 );

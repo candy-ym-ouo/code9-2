@@ -1,22 +1,27 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Button, Card, Empty, Input, Space, Table, Tag, Typography, Upload, message } from 'antd';
+import type { UploadFile } from 'antd';
 import type { InspirationDto } from '@flil/shared';
-import { useBulkTag, useCreateInspiration, useInspirations, useTags, useUploadAssets } from '../api/hooks.js';
+import { useBulkTag, useCreateInspiration, useInboxImport, useInspirations, useTags, useUploadAssets } from '../api/hooks.js';
 import { TagPicker } from '../components/TagPicker.js';
 
-/** 收件箱 = 采集闭环的入口：上传 → 10 秒打标 → 补条件 */
+/** 收件箱 = 采集闭环的入口：导入归并 → 10 秒打标 → 补条件 */
 export default function Inbox() {
   const inbox = useInspirations({ status: 'draft,tagging,timing_missing', size: 50 });
   const { data: tags } = useTags();
   const create = useCreateInspiration();
   const bulkTag = useBulkTag();
   const uploadAssets = useUploadAssets();
+  const inboxImport = useInboxImport();
 
   const [title, setTitle] = useState('');
   const [selected, setSelected] = useState<string[]>([]);
   const [pickedTags, setPickedTags] = useState<string[]>([]);
   const [uploadingFor, setUploadingFor] = useState<string | null>(null);
+  const [importTitle, setImportTitle] = useState('');
+  const [importTagIds, setImportTagIds] = useState<string[]>([]);
+  const [importFiles, setImportFiles] = useState<UploadFile[]>([]);
 
   const items = inbox.data?.items ?? [];
 
@@ -43,9 +48,71 @@ export default function Inbox() {
     }
   }
 
+  async function runImport() {
+    const files = importFiles.map((f) => f.originFileObj).filter((f): f is File => Boolean(f));
+    if (!files.length) {
+      message.warning('先选择至少一张图片');
+      return;
+    }
+    try {
+      const res = await inboxImport.mutateAsync({
+        files,
+        title: importTitle.trim() || undefined,
+        tagIds: importTagIds.length ? importTagIds : undefined,
+      });
+      if (res.duplicated) {
+        message.info({
+          content:
+            res.matchKey === 'image_fingerprint'
+              ? `图片指纹命中：已并入现有卡片，${res.skippedAssetCount} 张重复图片未重复入库`
+              : '标题与时间命中：已归并进现有卡片，标签与素材完整保留',
+          duration: 6,
+        });
+      } else {
+        message.success(`已加入收件箱（新图 ${res.importedAssetIds.length} 张）`);
+      }
+      setImportFiles([]);
+      setImportTitle('');
+      setImportTagIds([]);
+    } catch (err) {
+      message.error((err as Error).message);
+    }
+  }
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
-      <Card title="① 快速收一张卡">
+      <Card title="① 导入到收件箱（自动按图片指纹 / 标题+时间归并）">
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Space wrap>
+            <Upload
+              multiple
+              accept="image/*"
+              fileList={importFiles}
+              beforeUpload={() => false}
+              onChange={({ fileList }) => setImportFiles(fileList.slice(-20))}
+              onRemove={(file) => setImportFiles((prev) => prev.filter((f) => f.uid !== file.uid))}
+            >
+              <Button>选择图片（可多选）</Button>
+            </Upload>
+            <Input
+              placeholder="标题（留空则取第一张图的文件名）"
+              value={importTitle}
+              onChange={(e) => setImportTitle(e.target.value)}
+              style={{ width: 320 }}
+            />
+            <Button type="primary" loading={inboxImport.isPending} onClick={runImport}>
+              导入
+            </Button>
+          </Space>
+          <TagPicker tree={tags?.items ?? []} value={importTagIds} onChange={setImportTagIds} />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            重复导入不会产生新卡片：图片指纹（sha256）相同直接并入；标题相同且拍摄时间相差 90
+            分钟内也视为同一条。归并后标签、素材与窗口历史完整保留。
+          </Typography.Text>
+        </Space>
+      </Card>
+
+      <Card title="② 快速收一张无图卡">
         <Space>
           <Input
             placeholder="一句话描述这条灵感，例如：三号楼连廊黄昏逆光"
@@ -64,7 +131,7 @@ export default function Inbox() {
       </Card>
 
       <Card
-        title={`② 批量打标（已选 ${selected.length} 张）`}
+        title={`③ 批量打标（已选 ${selected.length} 张）`}
         extra={
           <Button type="primary" loading={bulkTag.isPending} disabled={!selected.length || !pickedTags.length} onClick={applyTags}>
             应用到已选卡片
@@ -77,7 +144,7 @@ export default function Inbox() {
         </Typography.Text>
       </Card>
 
-      <Card title="③ 待整理清单">
+      <Card title="④ 待整理清单">
         {items.length === 0 ? (
           <Empty description="收件箱是空的，去现实里找点什么吧" />
         ) : (
